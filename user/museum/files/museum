@@ -1,0 +1,9 @@
+type = process
+command = /usr/bin/museum
+run-as = _museum
+# required to read /etc configuration
+working-dir = /usr/share/museum
+logfile = /var/log/museum.log
+capabilities = ^cap_net_bind_service
+depends-on: network.target
+depends-on: local.target
