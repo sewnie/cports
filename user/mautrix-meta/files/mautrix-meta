@@ -1,0 +1,7 @@
+type = process
+command = /usr/bin/mautrix-meta --config /etc/mautrix-meta/config.yaml
+run-as = _mautrix-meta
+working-dir = /var/lib/mautrix-meta
+logfile = /var/log/mautrix-meta.log
+depends-on: network.target
+depends-on: local.target
