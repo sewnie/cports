@@ -1,0 +1,7 @@
+type = process
+command = /usr/bin/mautrix-discord --config /etc/mautrix-discord/config.yaml
+run-as = _mautrix-discord
+working-dir = /var/lib/mautrix-discord
+logfile = /var/log/mautrix-discord.log
+depends-on: network.target
+depends-on: local.target
