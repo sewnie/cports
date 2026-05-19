@@ -1,5 +1,5 @@
 pkgname = "lact"
-pkgver = "0.8.3"
+pkgver = "0.9.0"
 pkgrel = 0
 build_style = "cargo"
 make_build_args = ["-p", f"{pkgname}"]
@@ -10,6 +10,7 @@ hostmakedepends = [
 ]
 makedepends = [
     "gtk4-devel",
+    "libadwaita-devel",
     "linux-headers",
     "ocl-icd-devel",
     "rust-std",
@@ -19,7 +20,7 @@ pkgdesc = "AMDGPU Controller application"
 license = "MIT"
 url = "https://github.com/ilya-zlobintsev/LACT"
 source = f"{url}/archive/refs/tags/v{pkgver}.tar.gz"
-sha256 = "f604b26fadfa4a53d5aaa7c8d8953dc8989710a8d68b3778efbde29ad7889bb0"
+sha256 = "4a422ef394351704b6506d97e1a8ff262b8cd9af4b81ef1e096bc60c22797bf8"
 # We don't want to test hardware on CI machine
 options = ["!check"]
 
