@@ -1,0 +1,7 @@
+type = process
+command = /usr/bin/navidrome --configfile /etc/navidrome/navidrome.toml
+run-as = _navidrome
+working-dir = /var/lib/navidrome
+logfile = /var/log/navidrome.log
+depends-on: local.target
+depends-on: network.target

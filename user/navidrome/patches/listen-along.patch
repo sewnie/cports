@@ -1,0 +1,1675 @@
+diff --git a/core/scrobbler/now_playing_visibility_test.go b/core/scrobbler/now_playing_visibility_test.go
+new file mode 100644
+index 00000000..aa2bf086
+--- /dev/null
++++ b/core/scrobbler/now_playing_visibility_test.go
+@@ -0,0 +1,80 @@
++package scrobbler
++
++import (
++	"context"
++
++	"github.com/navidrome/navidrome/conf/configtest"
++	"github.com/navidrome/navidrome/model"
++	"github.com/navidrome/navidrome/model/request"
++	"github.com/navidrome/navidrome/tests"
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++)
++
++var _ = Describe("GetNowPlaying visibility", func() {
++	var ds *tests.MockDataStore
++	var tracker *playTracker
++	var admin, alice, bob model.User
++
++	userCtx := func(u model.User) context.Context {
++		ctx := request.WithUser(GinkgoT().Context(), u)
++		return request.WithPlayer(ctx, model.Player{ScrobbleEnabled: true})
++	}
++
++	play := func(u model.User) {
++		Expect(tracker.ReportPlayback(userCtx(u), ReportPlaybackParams{
++			MediaId:      "123",
++			PositionMs:   1000,
++			State:        StatePlaying,
++			PlaybackRate: 1,
++			ClientId:     u.ID + "-client",
++			ClientName:   "Player",
++		})).To(Succeed())
++	}
++
++	usernames := func(u model.User) []string {
++		sessions, err := tracker.GetNowPlaying(userCtx(u))
++		Expect(err).ToNot(HaveOccurred())
++		var res []string
++		for _, s := range sessions {
++			res = append(res, s.Username)
++		}
++		return res
++	}
++
++	BeforeEach(func() {
++		DeferCleanup(configtest.SetupConfig())
++		ds = &tests.MockDataStore{}
++		tracker = newPlayTracker(ds, &fakeEventBroker{}, nil)
++		DeferCleanup(tracker.stopBackgroundWorkers)
++
++		libs := model.Libraries{{ID: 1}}
++		admin = model.User{ID: "u-admin", UserName: "admin", IsAdmin: true, Libraries: libs}
++		alice = model.User{ID: "u-alice", UserName: "alice", Libraries: libs}
++		bob = model.User{ID: "u-bob", UserName: "bob", Libraries: libs}
++		for _, u := range []*model.User{&admin, &alice, &bob} {
++			Expect(ds.User().Put(GinkgoT().Context(), u)).To(Succeed())
++		}
++
++		track := model.MediaFile{ID: "123", LibraryID: 1, Title: "Track Title"}
++		Expect(ds.MediaFile().Put(GinkgoT().Context(), &track)).To(Succeed())
++
++		play(admin)
++		play(alice)
++		play(bob)
++	})
++
++	It("shows admins every session", func() {
++		Expect(usernames(admin)).To(ConsistOf("admin", "alice", "bob"))
++	})
++
++	It("shows other users only the sessions of admins and their own", func() {
++		Expect(usernames(alice)).To(ConsistOf("admin", "alice"))
++	})
++
++	It("hides sessions of a demoted admin", func() {
++		admin.IsAdmin = false
++		Expect(ds.User().Put(GinkgoT().Context(), &admin)).To(Succeed())
++		Expect(usernames(alice)).To(ConsistOf("alice"))
++	})
++})
+diff --git a/core/scrobbler/play_tracker.go b/core/scrobbler/play_tracker.go
+index 541a8e92..1e72e7bf 100644
+--- a/core/scrobbler/play_tracker.go
++++ b/core/scrobbler/play_tracker.go
+@@ -452,6 +452,9 @@ func (p *playTracker) GetNowPlaying(ctx context.Context) ([]PlaybackSession, err
+ 		res = slice.Filter(res, func(s PlaybackSession) bool {
+ 			return user.HasLibraryAccess(s.MediaFile.LibraryID)
+ 		})
++		if !user.IsAdmin {
++			res = p.adminSessions(ctx, user, res)
++		}
+ 	}
+ 	slices.SortFunc(res, func(a, b PlaybackSession) int {
+ 		return b.Start.Compare(a.Start)
+@@ -467,6 +470,24 @@ func (p *playTracker) GetNowPlaying(ctx context.Context) ([]PlaybackSession, err
+ 	return res, nil
+ }
+ 
++// adminSessions keeps the sessions of admins and the user's own. Users other than admins
++// only see what admins are playing, as those are the only users they can listen along with.
++func (p *playTracker) adminSessions(ctx context.Context, user model.User, sessions []PlaybackSession) []PlaybackSession {
++	isAdmin := map[string]bool{user.ID: true}
++	return slice.Filter(sessions, func(s PlaybackSession) bool {
++		admin, ok := isAdmin[s.UserId]
++		if !ok {
++			u, err := p.ds.User().Get(ctx, s.UserId)
++			if err != nil {
++				log.Warn(ctx, "Error loading user of now playing session", "userId", s.UserId, err)
++			}
++			admin = err == nil && u.IsAdmin
++			isAdmin[s.UserId] = admin
++		}
++		return admin
++	})
++}
++
+ func (p *playTracker) Submit(ctx context.Context, submissions []Submission) error {
+ 	username, _ := request.UsernameFrom(ctx)
+ 	player, _ := request.PlayerFrom(ctx)
+diff --git a/core/scrobbler/play_tracker_test.go b/core/scrobbler/play_tracker_test.go
+index 04582781..1313ed4a 100644
+--- a/core/scrobbler/play_tracker_test.go
++++ b/core/scrobbler/play_tracker_test.go
+@@ -161,7 +161,9 @@ var _ = Describe("PlayTracker", func() {
+ 				MediaId: "456", PositionMs: 0, State: StatePlaying, PlaybackRate: 1.0, ClientId: "player-2", ClientName: "player-two",
+ 			})
+ 
+-			playing, err := tracker.GetNowPlaying(ctx)
++			// Only admins see other users' sessions
++			adminCtx := request.WithUser(GinkgoT().Context(), model.User{ID: "adm", IsAdmin: true})
++			playing, err := tracker.GetNowPlaying(adminCtx)
+ 
+ 			Expect(err).ToNot(HaveOccurred())
+ 			Expect(playing).To(HaveLen(2))
+diff --git a/ui/src/App.jsx b/ui/src/App.jsx
+index 4de36939..06966ebe 100644
+--- a/ui/src/App.jsx
++++ b/ui/src/App.jsx
+@@ -35,6 +35,7 @@ import {
+   albumViewReducer,
+   activityReducer,
+   settingsReducer,
++  listenAlongReducer,
+   replayGainReducer,
+   downloadMenuDialogReducer,
+   shareDialogReducer,
+@@ -78,6 +79,7 @@ const adminStore = createAdminStore({
+     shareDialog: shareDialogReducer,
+     activity: activityReducer,
+     settings: settingsReducer,
++    listenAlong: listenAlongReducer,
+     replayGain: replayGainReducer,
+     transcoding: transcodingReducer,
+   },
+diff --git a/ui/src/actions/index.js b/ui/src/actions/index.js
+index 9f35f86a..8f6ef931 100644
+--- a/ui/src/actions/index.js
++++ b/ui/src/actions/index.js
+@@ -6,3 +6,4 @@ export * from './dialogs'
+ export * from './replayGain'
+ export * from './serverEvents'
+ export * from './settings'
++export * from './listenAlong'
+diff --git a/ui/src/actions/listenAlong.js b/ui/src/actions/listenAlong.js
+new file mode 100644
+index 00000000..f14c94b4
+--- /dev/null
++++ b/ui/src/actions/listenAlong.js
+@@ -0,0 +1,29 @@
++export const LISTEN_ALONG_START = 'LISTEN_ALONG_START'
++export const LISTEN_ALONG_UPDATE = 'LISTEN_ALONG_UPDATE'
++export const LISTEN_ALONG_STOP = 'LISTEN_ALONG_STOP'
++
++// leader is { username, playerName }; session is the leader's current playback
++export const listenAlongStart = (leader, session) => ({
++  type: LISTEN_ALONG_START,
++  data: { leader, session },
++})
++
++// receivedAt is the local time the session's position was estimated at
++export const listenAlongUpdate = (session, receivedAt = Date.now()) => ({
++  type: LISTEN_ALONG_UPDATE,
++  data: { session, receivedAt },
++})
++
++export const listenAlongStop = () => ({
++  type: LISTEN_ALONG_STOP,
++})
++
++// Builds the leader's session from a Subsonic getNowPlaying entry
++export const sessionFromNowPlaying = (entry) => ({
++  username: entry.username,
++  playerName: entry.playerName,
++  trackId: entry.id,
++  state: entry.state,
++  positionMs: entry.positionMs || 0,
++  playbackRate: entry.playbackRate || 1,
++})
+diff --git a/ui/src/audioplayer/Player.jsx b/ui/src/audioplayer/Player.jsx
+index c3d795b2..e6eaade9 100644
+--- a/ui/src/audioplayer/Player.jsx
++++ b/ui/src/audioplayer/Player.jsx
+@@ -34,6 +34,7 @@ import { keyMap } from '../hotkeys'
+ import keyHandlers from './keyHandlers'
+ import { calculateGain } from '../utils/calculateReplayGain'
+ import { detectBrowserProfile, decisionService } from '../transcode'
++import { useListenAlongSync } from '../listenAlong'
+ 
+ const Player = () => {
+   const theme = useCurrentTheme()
+@@ -66,11 +67,12 @@ const Player = () => {
+   useInterval(
+     () => {
+       if (heartbeatTrackId && !stoppedRef.current) {
+-        subsonic.reportPlayback(
+-          heartbeatTrackId,
+-          lastPositionMsRef.current,
+-          'playing',
+-        )
++        // Progress events are throttled, so read the live position when possible
++        const posMs =
++          audioInstance && !audioInstance.paused
++            ? Math.floor(audioInstance.currentTime * 1000)
++            : lastPositionMsRef.current
++        subsonic.reportPlayback(heartbeatTrackId, posMs, 'playing')
+       }
+     },
+     heartbeatTrackId ? config.playbackReportIntervalMs : null,
+@@ -278,6 +280,14 @@ const Player = () => {
+     [dispatch],
+   )
+ 
++  // The player's own position lags the audio element, which matters to listeners
++  // following this player in sync
++  const livePositionMs = useCallback(
++    (info) =>
++      Math.floor((audioInstance?.currentTime ?? info.currentTime) * 1000),
++    [audioInstance],
++  )
++
+   const onAudioPlay = useCallback(
+     (info) => {
+       if (context && context.state !== 'running') {
+@@ -289,7 +299,7 @@ const Player = () => {
+         const song = info.song
+         document.title = `${song.title} - ${song.artist} - Navidrome`
+         if (!info.isRadio) {
+-          const posMs = Math.floor(info.currentTime * 1000)
++          const posMs = livePositionMs(info)
+           lastPositionMsRef.current = posMs
+           const isNewTrack = info.trackId !== currentTrackId
+           if (isNewTrack) {
+@@ -320,7 +330,7 @@ const Player = () => {
+         }
+       }
+     },
+-    [context, dispatch, showNotifications, currentTrackId],
++    [context, dispatch, showNotifications, currentTrackId, livePositionMs],
+   )
+ 
+   const onAudioPlayTrackChange = useCallback(() => {
+@@ -339,13 +349,13 @@ const Player = () => {
+     (info) => {
+       dispatch(currentPlaying(info))
+       if (!info.isRadio && currentTrackId) {
+-        const posMs = Math.floor(info.currentTime * 1000)
++        const posMs = livePositionMs(info)
+         lastPositionMsRef.current = posMs
+         subsonic.reportPlayback(currentTrackId, posMs, 'paused')
+       }
+       setHeartbeatTrackId(null)
+     },
+-    [dispatch, currentTrackId],
++    [dispatch, currentTrackId, livePositionMs],
+   )
+ 
+   const onAudioEnded = useCallback(
+@@ -413,6 +423,8 @@ const Player = () => {
+     document.title = 'Navidrome'
+   }
+ 
++  useListenAlongSync(audioInstance)
++
+   const handlers = useMemo(
+     () => keyHandlers(audioInstance, playerState),
+     [audioInstance, playerState],
+diff --git a/ui/src/i18n/en.json b/ui/src/i18n/en.json
+index 8f086f51..8412de8e 100644
+--- a/ui/src/i18n/en.json
++++ b/ui/src/i18n/en.json
+@@ -767,6 +767,13 @@
+     "status": "Scan Error",
+     "elapsedTime": "Elapsed Time"
+   },
++  "listenAlong": {
++    "follow": "Listen along with %{username}",
++    "stop": "Stop listening along with %{username}",
++    "ended": "%{username} stopped playing",
++    "left": "Stopped listening along with %{username}",
++    "trackUnavailable": "The track being played is not available to you"
++  },
+   "nowPlaying": {
+     "title": "Now Playing",
+     "empty": "Nothing playing",
+diff --git a/ui/src/layout/AppBar.jsx b/ui/src/layout/AppBar.jsx
+index 460d33bb..6176a9ca 100644
+--- a/ui/src/layout/AppBar.jsx
++++ b/ui/src/layout/AppBar.jsx
+@@ -128,9 +128,9 @@ const CustomUserMenu = ({ onClick, ...rest }) => {
+ 
+   return (
+     <>
+-      {config.devActivityPanel &&
+-        permissions === 'admin' &&
+-        config.enableNowPlaying && <NowPlayingPanel />}
++      {config.devActivityPanel && config.enableNowPlaying && (
++        <NowPlayingPanel />
++      )}
+       {config.devActivityPanel && permissions === 'admin' && <ActivityPanel />}
+       <UserMenu {...rest}>
+         <PersonalMenu sidebarIsOpen={true} onClick={onClick} />
+diff --git a/ui/src/layout/NowPlayingPanel.jsx b/ui/src/layout/NowPlayingPanel.jsx
+index 509263b4..8140223b 100644
+--- a/ui/src/layout/NowPlayingPanel.jsx
++++ b/ui/src/layout/NowPlayingPanel.jsx
+@@ -19,14 +19,22 @@ import {
+   useMediaQuery,
+ } from '@material-ui/core'
+ import { FaRegCirclePlay, FaPause } from 'react-icons/fa6'
++import { MdHeadphones } from 'react-icons/md'
+ import subsonic from '../subsonic'
+ import { useInterval } from '../common'
+-import { nowPlayingCountSync } from '../actions'
++import {
++  listenAlongStart,
++  listenAlongStop,
++  nowPlayingCountSync,
++  sessionFromNowPlaying,
++} from '../actions'
++import { expectedPositionMs } from '../listenAlong/useListenAlongSync'
+ import { formatDuration } from '../utils'
+ import config from '../config'
+ 
+ const useStyles = makeStyles((theme) => ({
+   button: { color: 'inherit' },
++  following: { color: theme.palette.primary.main },
+   list: {
+     width: '26em',
+     maxHeight: (props) => {
+@@ -140,6 +148,10 @@ const useStyles = makeStyles((theme) => ({
+     color: theme.palette.text.disabled,
+     marginTop: theme.spacing(0.25),
+   },
++  listenAlongButton: {
++    flexShrink: 0,
++    alignSelf: 'center',
++  },
+   badge: {
+     '& .MuiBadge-badge': {
+       backgroundColor: theme.palette.primary.main,
+@@ -149,14 +161,14 @@ const useStyles = makeStyles((theme) => ({
+ }))
+ 
+ // NowPlayingButton component - handles the button with badge
+-const NowPlayingButton = React.memo(({ count, onClick }) => {
++const NowPlayingButton = React.memo(({ count, following, onClick }) => {
+   const classes = useStyles()
+   const translate = useTranslate()
+ 
+   return (
+     <Tooltip title={translate('nowPlaying.title')}>
+       <IconButton
+-        className={classes.button}
++        className={following ? classes.following : classes.button}
+         onClick={onClick}
+         aria-label={translate('nowPlaying.title')}
+         aria-haspopup="true"
+@@ -178,12 +190,22 @@ NowPlayingButton.displayName = 'NowPlayingButton'
+ 
+ NowPlayingButton.propTypes = {
+   count: PropTypes.number.isRequired,
++  following: PropTypes.bool,
+   onClick: PropTypes.func.isRequired,
+ }
+ 
+ const NowPlayingItem = React.memo(
+-  ({ nowPlayingEntry, onLinkClick, getArtistLink, now }) => {
++  ({
++    nowPlayingEntry,
++    onLinkClick,
++    getArtistLink,
++    now,
++    canListenAlong,
++    listeningAlong,
++    onListenAlong,
++  }) => {
+     const classes = useStyles()
++    const translate = useTranslate()
+     const isPaused = nowPlayingEntry.state === 'paused'
+     const isPlaying =
+       nowPlayingEntry.state === 'playing' ||
+@@ -271,6 +293,28 @@ const NowPlayingItem = React.memo(
+               : ''}
+           </Typography>
+         </div>
++        {(canListenAlong || listeningAlong) && (
++          <Tooltip
++            title={translate(
++              listeningAlong ? 'listenAlong.stop' : 'listenAlong.follow',
++              { username: nowPlayingEntry.username },
++            )}
++          >
++            <IconButton
++              size="small"
++              className={classes.listenAlongButton}
++              color={listeningAlong ? 'primary' : 'default'}
++              aria-pressed={listeningAlong}
++              aria-label={translate(
++                listeningAlong ? 'listenAlong.stop' : 'listenAlong.follow',
++                { username: nowPlayingEntry.username },
++              )}
++              onClick={() => onListenAlong(nowPlayingEntry)}
++            >
++              <MdHeadphones size={18} />
++            </IconButton>
++          </Tooltip>
++        )}
+       </ListItem>
+     )
+   },
+@@ -299,11 +343,25 @@ NowPlayingItem.propTypes = {
+   onLinkClick: PropTypes.func.isRequired,
+   getArtistLink: PropTypes.func.isRequired,
+   now: PropTypes.number.isRequired,
++  canListenAlong: PropTypes.bool,
++  listeningAlong: PropTypes.bool,
++  onListenAlong: PropTypes.func,
+ }
+ 
+ // NowPlayingList component - handles the popover content
+ const NowPlayingList = React.memo(
+-  ({ anchorEl, open, onClose, entries, onLinkClick, getArtistLink, now }) => {
++  ({
++    anchorEl,
++    open,
++    onClose,
++    entries,
++    onLinkClick,
++    getArtistLink,
++    now,
++    username,
++    leader,
++    onListenAlong,
++  }) => {
+     const classes = useStyles({ entryCount: entries.length })
+     const translate = useTranslate()
+ 
+@@ -336,6 +394,12 @@ const NowPlayingList = React.memo(
+                     onLinkClick={onLinkClick}
+                     getArtistLink={getArtistLink}
+                     now={now}
++                    canListenAlong={nowPlayingEntry.username !== username}
++                    listeningAlong={
++                      leader?.username === nowPlayingEntry.username &&
++                      leader?.playerName === nowPlayingEntry.playerName
++                    }
++                    onListenAlong={onListenAlong}
+                   />
+                 ))}
+               </List>
+@@ -357,12 +421,16 @@ NowPlayingList.propTypes = {
+   onLinkClick: PropTypes.func.isRequired,
+   getArtistLink: PropTypes.func.isRequired,
+   now: PropTypes.number.isRequired,
++  username: PropTypes.string,
++  leader: PropTypes.object,
++  onListenAlong: PropTypes.func.isRequired,
+ }
+ 
+ // Main NowPlayingPanel component
+ const NowPlayingPanel = () => {
+   const dispatch = useDispatch()
+   const count = useSelector((state) => state.activity.nowPlayingCount)
++  const leader = useSelector((state) => state.listenAlong?.leader)
+   const lastUpdate = useSelector((state) => state.activity.nowPlayingLastUpdate)
+   const streamReconnected = useSelector(
+     (state) => state.activity.streamReconnected,
+@@ -377,6 +445,9 @@ const NowPlayingPanel = () => {
+ 
+   const [anchorEl, setAnchorEl] = useState(null)
+   const [entries, setEntries] = useState([])
++  // The server only shows other users the sessions of admins, and their own
++  const isAdmin = localStorage.getItem('role') === 'admin'
++  const username = localStorage.getItem('username')
+   const [now, setNow] = useState(Date.now())
+   const open = Boolean(anchorEl)
+ 
+@@ -446,10 +517,36 @@ const NowPlayingPanel = () => {
+     if (serverUp) fetchList()
+   }, [fetchList, serverUp, streamReconnected])
+ 
+-  // Refresh when NowPlaying updates from SSE events (if panel is open)
++  // Refresh when NowPlaying updates from SSE events (if panel is open). The events
++  // count every session, so other users refetch to keep their badge to what they see
+   useEffect(() => {
+-    if (open && serverUp) fetchList()
+-  }, [lastUpdate, open, fetchList, serverUp])
++    if ((open || !isAdmin) && serverUp) fetchList()
++  }, [lastUpdate, open, isAdmin, fetchList, serverUp])
++
++  const handleListenAlong = useCallback(
++    (entry) => {
++      if (
++        leader?.username === entry.username &&
++        leader?.playerName === entry.playerName
++      ) {
++        dispatch(listenAlongStop())
++        return
++      }
++      const session = sessionFromNowPlaying(entry)
++      session.positionMs = expectedPositionMs(
++        session,
++        entry._fetchedAt,
++        Date.now(),
++      )
++      dispatch(
++        listenAlongStart(
++          { username: entry.username, playerName: entry.playerName },
++          session,
++        ),
++      )
++    },
++    [dispatch, leader],
++  )
+ 
+   // Update current time every second when open to animate progress bars
+   useInterval(() => setNow(Date.now()), open ? 1000 : null)
+@@ -472,7 +569,11 @@ const NowPlayingPanel = () => {
+ 
+   return (
+     <div>
+-      <NowPlayingButton count={count} onClick={handleMenuOpen} />
++      <NowPlayingButton
++        count={isAdmin ? count : entries.length}
++        following={!!leader}
++        onClick={handleMenuOpen}
++      />
+       <NowPlayingList
+         anchorEl={anchorEl}
+         open={open}
+@@ -481,6 +582,9 @@ const NowPlayingPanel = () => {
+         now={now}
+         onLinkClick={handleLinkClick}
+         getArtistLink={getArtistLink}
++        username={username}
++        leader={leader}
++        onListenAlong={handleListenAlong}
+       />
+     </div>
+   )
+diff --git a/ui/src/layout/NowPlayingPanel.test.jsx b/ui/src/layout/NowPlayingPanel.test.jsx
+index ea4a3568..604a1639 100644
+--- a/ui/src/layout/NowPlayingPanel.test.jsx
++++ b/ui/src/layout/NowPlayingPanel.test.jsx
+@@ -3,7 +3,7 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+ import { describe, it, beforeEach, vi } from 'vitest'
+ import { Provider } from 'react-redux'
+ import { createStore, combineReducers } from 'redux'
+-import { activityReducer } from '../reducers'
++import { activityReducer, listenAlongReducer } from '../reducers'
+ import NowPlayingPanel from './NowPlayingPanel'
+ import subsonic from '../subsonic'
+ 
+@@ -65,7 +65,10 @@ describe('<NowPlayingPanel />', () => {
+       },
+     }
+     return createStore(
+-      combineReducers({ activity: activityReducer }),
++      combineReducers({
++        activity: activityReducer,
++        listenAlong: listenAlongReducer,
++      }),
+       defaultState,
+     )
+   }
+@@ -78,6 +81,8 @@ describe('<NowPlayingPanel />', () => {
+     vi.useFakeTimers()
+     vi.clearAllMocks()
+     mockUseMediaQuery.mockReturnValue(false) // Default to large screen
++    localStorage.setItem('role', 'admin')
++    localStorage.setItem('username', 'me')
+ 
+     subsonic.getNowPlaying.mockResolvedValue({
+       json: {
+@@ -360,4 +365,77 @@ describe('<NowPlayingPanel />', () => {
+ 
+     vi.useRealTimers()
+   })
++
++  describe('listen along', () => {
++    const entry = (username) => ({
++      playerId: 1,
++      id: `track-${username}`,
++      username,
++      playerName: 'Web',
++      title: `Song of ${username}`,
++      albumId: 'album1',
++      state: 'playing',
++      positionMs: 1000,
++      playbackRate: 1,
++    })
++
++    beforeEach(() => {
++      subsonic.getNowPlaying.mockResolvedValue({
++        json: {
++          'subsonic-response': {
++            status: 'ok',
++            nowPlaying: { entry: [entry('admin'), entry('bob')] },
++          },
++        },
++      })
++    })
++
++    const openPanel = async (store) => {
++      render(
++        <Provider store={store}>
++          <NowPlayingPanel />
++        </Provider>,
++      )
++      fireEvent.click(screen.getByRole('button'))
++      await vi.advanceTimersByTimeAsync(300)
++    }
++
++    it('offers listening along with everyone but the user', async () => {
++      localStorage.setItem('username', 'admin')
++      await openPanel(createMockStore())
++
++      expect(screen.getByText('Song of admin')).toBeInTheDocument()
++      expect(
++        screen.getAllByRole('button', { name: 'listenAlong.follow' }),
++      ).toHaveLength(1)
++    })
++
++    it("counts other users' visible sessions in the badge", async () => {
++      localStorage.setItem('role', 'user')
++      await openPanel(createMockStore({ nowPlayingCount: 5 }))
++
++      expect(screen.getByText('2')).toBeInTheDocument()
++    })
++
++    it('starts and stops listening along', async () => {
++      localStorage.setItem('username', 'admin')
++      const store = createMockStore()
++      await openPanel(store)
++
++      fireEvent.click(
++        screen.getByRole('button', { name: 'listenAlong.follow' }),
++      )
++      expect(store.getState().listenAlong.leader).toEqual({
++        username: 'bob',
++        playerName: 'Web',
++      })
++      expect(store.getState().listenAlong.session).toMatchObject({
++        trackId: 'track-bob',
++        state: 'playing',
++      })
++
++      fireEvent.click(screen.getByRole('button', { name: 'listenAlong.stop' }))
++      expect(store.getState().listenAlong.leader).toBeNull()
++    })
++  })
+ })
+diff --git a/ui/src/listenAlong/index.js b/ui/src/listenAlong/index.js
+new file mode 100644
+index 00000000..869d64cd
+--- /dev/null
++++ b/ui/src/listenAlong/index.js
+@@ -0,0 +1 @@
++export { useListenAlongSync } from './useListenAlongSync'
+diff --git a/ui/src/listenAlong/useListenAlongSync.js b/ui/src/listenAlong/useListenAlongSync.js
+new file mode 100644
+index 00000000..afbf2106
+--- /dev/null
++++ b/ui/src/listenAlong/useListenAlongSync.js
+@@ -0,0 +1,340 @@
++import { useCallback, useEffect, useRef } from 'react'
++import { useDispatch, useSelector } from 'react-redux'
++import { useDataProvider, useNotify } from 'react-admin'
++import subsonic from '../subsonic'
++import { useInterval } from '../common'
++import {
++  listenAlongStop,
++  listenAlongUpdate,
++  sessionFromNowPlaying,
++  setTrack,
++} from '../actions'
++
++// Listeners may be this far from the leader without being corrected. Correcting means
++// seeking, which interrupts the music, so small drifts are left alone
++export const SYNC_TOLERANCE_MS = 5000
++// When the listener starts playing anyway (joining, the leader resuming), a seek costs
++// nothing audible, so it lines them up more closely
++const START_TOLERANCE_MS = 1000
++// How often a playing listener's drift is checked. This makes no requests
++const DRIFT_CHECK_INTERVAL_MS = 5000
++// Never seek more often than this while playing
++const SEEK_COOLDOWN_MS = 30000
++// Seek events this soon after a seek of ours are its own
++const OWN_SEEK_WINDOW_MS = 1000
++// The player may seek on its own while it loads a track
++const TRACK_LOAD_GRACE_MS = 2000
++// The player moves on by itself when a track ends, before the leader's next one is known
++const TRACK_END_GRACE_MS = 3000
++// A leader is briefly missing from Now Playing between two tracks
++export const LEADER_GONE_GRACE_MS = 15000
++// Now playing updates arrive in bursts, one per playback report
++const FETCH_DEBOUNCE_MS = 500
++
++const isPlayingState = (state) => state === 'playing' || state === 'starting'
++
++// Position the leader is expected to be at now, extrapolated from the last report
++export const expectedPositionMs = (session, receivedAt, now) => {
++  if (!isPlayingState(session.state)) return session.positionMs
++  const rate = session.playbackRate || 1
++  return session.positionMs + (now - receivedAt) * rate
++}
++
++// Picks the leader's entry, preferring the player they were followed on
++export const findLeaderEntry = (entries, leader) => {
++  const own = entries.filter((e) => e.username === leader.username)
++  return own.find((e) => e.playerName === leader.playerName) || own[0]
++}
++
++// useListenAlongSync drives the player to follow the leader's playback, read from the
++// Now Playing list each time a playback report is broadcast. It loads the leader's
++// track and mirrors play/pause changes. Like Spotify's group sessions, it keeps the
++// listener roughly in sync rather than exactly: it never changes the playback speed,
++// and seeks only when the listener starts playing or has drifted further than
++// SYNC_TOLERANCE_MS, at most once per SEEK_COOLDOWN_MS. Nothing here affects the
++// leader's player. A pause by the listener is kept until the leader's state changes;
++// seeking or changing tracks themselves stops following. When a track ends, the
++// listener waits for the leader's next one.
++export const useListenAlongSync = (audioInstance) => {
++  const dispatch = useDispatch()
++  const dataProvider = useDataProvider()
++  const notify = useNotify()
++  const { leader, session, receivedAt } = useSelector(
++    (state) => state.listenAlong,
++  )
++  const currentTrackId = useSelector((state) => state.player.current?.trackId)
++  const lastUpdate = useSelector((state) => state.activity.nowPlayingLastUpdate)
++  const serverStart = useSelector(
++    (state) => state.activity.serverStart.startTime,
++  )
++  const streamReconnected = useSelector(
++    (state) => state.activity.streamReconnected,
++  )
++  const leaderRef = useRef(leader)
++  leaderRef.current = leader
++  // Tracks requested for the leader, to tell them apart from the listener's own choices
++  const requestedTracksRef = useRef(new Set())
++  const loadingTrackRef = useRef(null)
++  const appliedStateRef = useRef(null)
++  const ownSeekUntilRef = useRef(0)
++  const lastSeekAtRef = useRef(0)
++  const rateChangedRef = useRef(false)
++  const trackLoadedAtRef = useRef(0)
++  const lastTimeRef = useRef(0)
++  const missingSinceRef = useRef(null)
++  const recheckTimerRef = useRef(null)
++  const holdPausedUntilRef = useRef(0)
++  const endedAtRef = useRef(0)
++
++  const stopFollowing = useCallback(
++    (message) => {
++      const following = leaderRef.current
++      if (!following) return
++      dispatch(listenAlongStop())
++      notify(message, 'info', { username: following.username })
++    },
++    [dispatch, notify],
++  )
++
++  const syncSeek = useCallback(
++    (positionMs) => {
++      const now = Date.now()
++      ownSeekUntilRef.current = now + OWN_SEEK_WINDOW_MS
++      lastSeekAtRef.current = now
++      audioInstance.currentTime = Math.max(0, positionMs) / 1000
++    },
++    [audioInstance],
++  )
++
++  const refreshRef = useRef()
++  refreshRef.current = () => {
++    const following = leaderRef.current
++    if (!following) return
++    const requestedAt = Date.now()
++    // The server leaves out sessions the user cannot follow, such as a demoted admin's
++    subsonic
++      .getNowPlaying()
++      .then((resp) => resp.json['subsonic-response'])
++      .then((data) => {
++        if (leaderRef.current !== following || data.status !== 'ok') return
++        const entry = findLeaderEntry(data.nowPlaying?.entry || [], following)
++        const now = Date.now()
++        if (entry) {
++          missingSinceRef.current = null
++          // The server estimates the position while handling the request, about
++          // halfway through it
++          dispatch(
++            listenAlongUpdate(
++              sessionFromNowPlaying(entry),
++              (requestedAt + now) / 2,
++            ),
++          )
++          return
++        }
++        if (missingSinceRef.current === null) missingSinceRef.current = now
++        const missingFor = now - missingSinceRef.current
++        if (missingFor >= LEADER_GONE_GRACE_MS) {
++          stopFollowing('listenAlong.ended')
++          return
++        }
++        clearTimeout(recheckTimerRef.current)
++        recheckTimerRef.current = setTimeout(
++          () => refreshRef.current(),
++          LEADER_GONE_GRACE_MS - missingFor,
++        )
++      })
++      .catch(() => {})
++  }
++
++  useEffect(() => {
++    if (!leader || !serverStart) return
++    const timer = setTimeout(() => refreshRef.current(), FETCH_DEBOUNCE_MS)
++    return () => clearTimeout(timer)
++  }, [leader, lastUpdate, serverStart, streamReconnected])
++
++  useEffect(() => {
++    if (leader) return
++    requestedTracksRef.current.clear()
++    loadingTrackRef.current = null
++    appliedStateRef.current = null
++    missingSinceRef.current = null
++    holdPausedUntilRef.current = 0
++    clearTimeout(recheckTimerRef.current)
++    if (audioInstance && rateChangedRef.current) audioInstance.playbackRate = 1
++    rateChangedRef.current = false
++  }, [leader, audioInstance])
++
++  useEffect(() => () => clearTimeout(recheckTimerRef.current), [])
++
++  // Changing tracks stops following, unless the track is the leader's or the
++  // player moved on at the end of a track
++  const prevTrackRef = useRef(currentTrackId)
++  useEffect(() => {
++    const prev = prevTrackRef.current
++    prevTrackRef.current = currentTrackId
++    if (!leader || !currentTrackId || prev === currentTrackId) return
++    if (requestedTracksRef.current.has(currentTrackId)) return
++    if (Date.now() - endedAtRef.current < TRACK_END_GRACE_MS) return
++    stopFollowing('listenAlong.left')
++  }, [leader, currentTrackId, stopFollowing])
++
++  // Seeking stops following, except for the seeks this hook and the player make.
++  // Also keeps the player from starting its own queue over while waiting for the
++  // leader's next track
++  useEffect(() => {
++    if (!audioInstance) return
++    const onLoadStart = () => {
++      trackLoadedAtRef.current = Date.now()
++    }
++    const onTimeUpdate = () => {
++      lastTimeRef.current = audioInstance.currentTime
++    }
++    const onSeeking = () => {
++      if (!leaderRef.current) return
++      const now = Date.now()
++      if (now < ownSeekUntilRef.current) return
++      if (now - trackLoadedAtRef.current < TRACK_LOAD_GRACE_MS) return
++      // Repeating the track seeks back to its start
++      if (lastTimeRef.current >= (audioInstance.duration || Infinity) - 1) {
++        return
++      }
++      stopFollowing('listenAlong.left')
++    }
++    const onPlay = () => {
++      if (leaderRef.current && Date.now() < holdPausedUntilRef.current) {
++        audioInstance.pause()
++      }
++    }
++    // Wait for the leader's next track, which also replaces whatever the player
++    // moves on to
++    const onEnded = () => {
++      if (!leaderRef.current) return
++      const now = Date.now()
++      endedAtRef.current = now
++      holdPausedUntilRef.current = now + LEADER_GONE_GRACE_MS
++      appliedStateRef.current = null
++    }
++    const events = {
++      loadstart: onLoadStart,
++      timeupdate: onTimeUpdate,
++      seeking: onSeeking,
++      play: onPlay,
++      ended: onEnded,
++    }
++    Object.entries(events).forEach(([name, fn]) =>
++      audioInstance.addEventListener(name, fn),
++    )
++    return () =>
++      Object.entries(events).forEach(([name, fn]) =>
++        audioInstance.removeEventListener(name, fn),
++      )
++  }, [audioInstance, stopFollowing])
++
++  // Loads the leader's track and mirrors their play/pause changes
++  useEffect(() => {
++    if (!leader || !session || !audioInstance) return
++
++    if (session.trackId !== currentTrackId) {
++      if (loadingTrackRef.current === session.trackId) return
++      loadingTrackRef.current = session.trackId
++      requestedTracksRef.current.add(session.trackId)
++      holdPausedUntilRef.current = 0
++      dataProvider
++        .getOne('song', { id: session.trackId })
++        .then(({ data }) => dispatch(setTrack(data)))
++        .catch(() => {
++          loadingTrackRef.current = null
++          notify('listenAlong.trackUnavailable', 'warning')
++        })
++      return
++    }
++    loadingTrackRef.current = null
++
++    const apply = () => {
++      const playing = isPlayingState(session.state)
++      const targetMs = expectedPositionMs(session, receivedAt, Date.now())
++      // A report from just before the leader's track ended: wait for their next one
++      if (
++        playing &&
++        audioInstance.duration &&
++        targetMs >= audioInstance.duration * 1000 - START_TOLERANCE_MS
++      ) {
++        return
++      }
++      const stateKey = `${session.trackId}:${session.state}`
++      const stateChanged = appliedStateRef.current !== stateKey
++      appliedStateRef.current = stateKey
++      if (!stateChanged) return
++
++      if (!playing) {
++        // Pausing leaves the listener close enough. Seeking would make the player
++        // resume, so the position is fixed when the leader plays again
++        audioInstance.pause()
++        return
++      }
++      holdPausedUntilRef.current = 0
++      const driftMs = audioInstance.currentTime * 1000 - targetMs
++      const tolerance = audioInstance.paused
++        ? START_TOLERANCE_MS
++        : SYNC_TOLERANCE_MS
++      if (Math.abs(driftMs) > tolerance) syncSeek(targetMs)
++      const rate = session.playbackRate || 1
++      if (audioInstance.playbackRate !== rate) {
++        audioInstance.playbackRate = rate
++        rateChangedRef.current = true
++      }
++      if (audioInstance.paused) audioInstance.play().catch(() => {})
++    }
++
++    // Seeking needs the track's metadata, which may still be loading
++    if (audioInstance.readyState >= 1) {
++      apply()
++      return
++    }
++    audioInstance.addEventListener('loadedmetadata', apply, { once: true })
++    return () => audioInstance.removeEventListener('loadedmetadata', apply)
++  }, [
++    leader,
++    session,
++    receivedAt,
++    currentTrackId,
++    audioInstance,
++    dataProvider,
++    dispatch,
++    notify,
++    syncSeek,
++  ])
++
++  // Brings back a playing listener who drifted far from a playing leader, such as
++  // after buffering
++  useInterval(
++    () => {
++      if (
++        !session ||
++        !isPlayingState(session.state) ||
++        session.trackId !== currentTrackId ||
++        audioInstance.paused ||
++        audioInstance.seeking ||
++        audioInstance.readyState < 3
++      ) {
++        return
++      }
++      const now = Date.now()
++      if (now - lastSeekAtRef.current < SEEK_COOLDOWN_MS) return
++      const targetMs = expectedPositionMs(session, receivedAt, now)
++      if (
++        audioInstance.duration &&
++        targetMs >= audioInstance.duration * 1000 - SYNC_TOLERANCE_MS
++      ) {
++        return
++      }
++      if (
++        Math.abs(audioInstance.currentTime * 1000 - targetMs) >
++        SYNC_TOLERANCE_MS
++      ) {
++        syncSeek(targetMs)
++      }
++    },
++    leader && audioInstance ? DRIFT_CHECK_INTERVAL_MS : null,
++  )
++}
+diff --git a/ui/src/listenAlong/useListenAlongSync.test.jsx b/ui/src/listenAlong/useListenAlongSync.test.jsx
+new file mode 100644
+index 00000000..5bf05149
+--- /dev/null
++++ b/ui/src/listenAlong/useListenAlongSync.test.jsx
+@@ -0,0 +1,521 @@
++import React from 'react'
++import { renderHook, act } from '@testing-library/react-hooks'
++import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
++import { Provider } from 'react-redux'
++import { createStore, combineReducers } from 'redux'
++import { listenAlongReducer } from '../reducers/listenAlongReducer'
++import {
++  PLAYER_SET_TRACK,
++  listenAlongStart,
++  listenAlongUpdate,
++} from '../actions'
++import {
++  LEADER_GONE_GRACE_MS,
++  SYNC_TOLERANCE_MS,
++  expectedPositionMs,
++  findLeaderEntry,
++  useListenAlongSync,
++} from './useListenAlongSync'
++
++const mockGetOne = vi.fn()
++const mockNotify = vi.fn()
++const mockGetNowPlaying = vi.fn()
++
++vi.mock('react-admin', () => ({
++  useDataProvider: () => ({ getOne: mockGetOne }),
++  useNotify: () => mockNotify,
++}))
++
++vi.mock('../subsonic', () => ({
++  default: { getNowPlaying: () => mockGetNowPlaying() },
++}))
++
++// An audio element whose position advances with the (fake) clock. Seeks take
++// seekDelayMs to resume playback, like a real stream does.
++const simulatedAudio = ({
++  positionMs = 0,
++  paused = false,
++  seekDelayMs = 0,
++}) => {
++  const listeners = {}
++  let base = positionMs
++  let baseAt = Date.now()
++  let rate = 1
++  let resumeAt = 0
++  let isPaused = paused
++  const position = () => {
++    const now = Date.now()
++    if (isPaused || now < resumeAt) return base
++    return base + (now - Math.max(baseAt, resumeAt)) * rate
++  }
++  const rebase = () => {
++    base = position()
++    baseAt = Math.max(Date.now(), resumeAt)
++  }
++  const audio = {
++    readyState: 4,
++    duration: 300,
++    seeks: 0,
++    get seeking() {
++      return Date.now() < resumeAt
++    },
++    get paused() {
++      return isPaused
++    },
++    get currentTime() {
++      return position() / 1000
++    },
++    set currentTime(seconds) {
++      audio.seeks++
++      base = seconds * 1000
++      resumeAt = Date.now() + seekDelayMs
++      baseAt = resumeAt
++      audio.emit('seeking')
++    },
++    get playbackRate() {
++      return rate
++    },
++    set playbackRate(value) {
++      rebase()
++      rate = value
++    },
++    play: vi.fn(() => {
++      rebase()
++      isPaused = false
++      audio.emit('play')
++      return Promise.resolve()
++    }),
++    pause: vi.fn(() => {
++      rebase()
++      isPaused = true
++    }),
++    addEventListener: vi.fn((name, fn) => {
++      listeners[name] = [...(listeners[name] || []), fn]
++    }),
++    removeEventListener: vi.fn((name, fn) => {
++      listeners[name] = (listeners[name] || []).filter((l) => l !== fn)
++    }),
++    emit: (name) => (listeners[name] || []).forEach((fn) => fn()),
++  }
++  return audio
++}
++
++describe('expectedPositionMs', () => {
++  it('extrapolates a playing session', () => {
++    const session = { state: 'playing', positionMs: 1000, playbackRate: 1.5 }
++    expect(expectedPositionMs(session, 0, 2000)).toBe(4000)
++  })
++
++  it('keeps the position of a paused session', () => {
++    const session = { state: 'paused', positionMs: 1000, playbackRate: 1 }
++    expect(expectedPositionMs(session, 0, 2000)).toBe(1000)
++  })
++})
++
++describe('findLeaderEntry', () => {
++  const leader = { username: 'admin', playerName: 'Web' }
++
++  it('prefers the player the leader was followed on', () => {
++    const entries = [
++      { username: 'admin', playerName: 'Phone' },
++      { username: 'admin', playerName: 'Web' },
++    ]
++    expect(findLeaderEntry(entries, leader)).toBe(entries[1])
++  })
++
++  it('falls back to another player of the leader', () => {
++    const entries = [
++      { username: 'bob', playerName: 'Web' },
++      { username: 'admin', playerName: 'Phone' },
++    ]
++    expect(findLeaderEntry(entries, leader)).toBe(entries[1])
++  })
++
++  it('returns nothing when the leader is not playing', () => {
++    expect(findLeaderEntry([{ username: 'bob' }], leader)).toBeUndefined()
++  })
++})
++
++describe('useListenAlongSync', () => {
++  let store
++  let actions
++  const leader = { username: 'admin', playerName: 'Web' }
++  const session = {
++    username: 'admin',
++    trackId: 't1',
++    state: 'playing',
++    positionMs: 30000,
++    playbackRate: 1,
++  }
++
++  const nowPlaying = (entry) => ({
++    json: { 'subsonic-response': { status: 'ok', nowPlaying: { entry } } },
++  })
++
++  const leaderEntry = (overrides = {}) => ({
++    username: 'admin',
++    playerName: 'Web',
++    id: 't1',
++    state: 'playing',
++    positionMs: 30000,
++    playbackRate: 1,
++    ...overrides,
++  })
++
++  const PLAYER_CHOOSE_TRACK = 'TEST_CHOOSE_TRACK'
++
++  const setup = (audio, currentTrackId) => {
++    actions = []
++    const player = (state = { current: { trackId: currentTrackId } }, a) => {
++      if (a.type === PLAYER_SET_TRACK || a.type === PLAYER_CHOOSE_TRACK) {
++        return { current: { trackId: a.data.id } }
++      }
++      return state
++    }
++    store = createStore(
++      combineReducers({
++        listenAlong: listenAlongReducer,
++        player,
++        activity: (
++          state = {
++            serverStart: { startTime: 1 },
++            streamReconnected: 0,
++            nowPlayingLastUpdate: 0,
++          },
++          a,
++        ) =>
++          a.type === 'nowPlayingCount'
++            ? { ...state, nowPlayingLastUpdate: state.nowPlayingLastUpdate + 1 }
++            : state,
++      }),
++    )
++    const dispatch = store.dispatch
++    store.dispatch = (a) => {
++      actions.push(a)
++      return dispatch(a)
++    }
++    const wrapper = ({ children }) => (
++      <Provider store={store}>{children}</Provider>
++    )
++    return renderHook(() => useListenAlongSync(audio), { wrapper })
++  }
++
++  const follow = (s = session) =>
++    act(() => {
++      store.dispatch(listenAlongStart(leader, s))
++    })
++
++  const advance = (ms) =>
++    act(async () => {
++      await vi.advanceTimersByTimeAsync(ms)
++    })
++
++  // The leader plays from 30000ms when the test starts, moved by leaderOffsetMs
++  let leaderOffsetMs
++  const leaderPositionMs = () => Date.now() - 70000 + leaderOffsetMs
++
++  // Moves the leader back so a listener in sync is ms ahead of them
++  const aheadBy = (ms) =>
++    act(() => {
++      leaderOffsetMs = -ms
++      store.dispatch(
++        listenAlongUpdate(
++          { ...session, positionMs: leaderPositionMs() },
++          Date.now(),
++        ),
++      )
++    })
++
++  // Drift of the listener from where the leader is now, in ms
++  const drift = (audio) => {
++    const { session: s, receivedAt } = store.getState().listenAlong
++    return (
++      audio.currentTime * 1000 - expectedPositionMs(s, receivedAt, Date.now())
++    )
++  }
++
++  beforeEach(() => {
++    vi.useFakeTimers()
++    vi.setSystemTime(100000)
++    vi.clearAllMocks()
++    leaderOffsetMs = 0
++    // Like the server, estimate where the leader is when asked
++    mockGetNowPlaying.mockImplementation(() =>
++      Promise.resolve(
++        nowPlaying([leaderEntry({ positionMs: leaderPositionMs() })]),
++      ),
++    )
++  })
++
++  afterEach(() => {
++    vi.useRealTimers()
++  })
++
++  it("loads the leader's track when a different one is playing", async () => {
++    mockGetOne.mockResolvedValue({ data: { id: 't1', title: 'Song' } })
++    setup(simulatedAudio({}), 'other')
++
++    await act(async () => {
++      store.dispatch(listenAlongStart(leader, session))
++    })
++
++    expect(mockGetOne).toHaveBeenCalledWith('song', { id: 't1' })
++    expect(actions.some((a) => a.type === PLAYER_SET_TRACK)).toBe(true)
++    expect(store.getState().listenAlong.leader).toEqual(leader)
++  })
++
++  it("seeks to the leader's position and resumes playback", () => {
++    const audio = simulatedAudio({ paused: true })
++    setup(audio, 't1')
++    follow()
++
++    expect(audio.currentTime).toBe(30)
++    expect(audio.play).toHaveBeenCalled()
++  })
++
++  it('leaves drifts within the tolerance alone', async () => {
++    const audio = simulatedAudio({ positionMs: 30000 })
++    setup(audio, 't1')
++    follow()
++    aheadBy(SYNC_TOLERANCE_MS - 500)
++
++    await advance(60000)
++
++    expect(audio.seeks).toBe(0)
++    expect(audio.playbackRate).toBe(1)
++    expect(audio.pause).not.toHaveBeenCalled()
++  })
++
++  it('seeks back to the leader when drifting too far, at most once in a while', async () => {
++    const audio = simulatedAudio({ positionMs: 30000, seekDelayMs: 800 })
++    setup(audio, 't1')
++    follow()
++    await advance(6000)
++    aheadBy(SYNC_TOLERANCE_MS + 1000)
++
++    await advance(6000)
++    expect(audio.seeks).toBe(1)
++    expect(Math.abs(drift(audio))).toBeLessThan(SYNC_TOLERANCE_MS)
++
++    // The leader moves back again, too soon for another seek
++    aheadBy(2 * (SYNC_TOLERANCE_MS + 1000))
++    await advance(6000)
++    expect(audio.seeks).toBe(1)
++    await advance(30000)
++    expect(audio.seeks).toBe(2)
++    expect(audio.playbackRate).toBe(1)
++  })
++
++  it('lines up closely when joining', () => {
++    const audio = simulatedAudio({ positionMs: 27000, paused: true })
++    setup(audio, 't1')
++    follow()
++
++    expect(audio.currentTime).toBe(30)
++  })
++
++  it('does not seek on repeated reports of the same state', () => {
++    const audio = simulatedAudio({ positionMs: 30000 })
++    setup(audio, 't1')
++    follow()
++    aheadBy(3000)
++    aheadBy(4000)
++
++    expect(audio.seeks).toBe(0)
++    expect(audio.play).not.toHaveBeenCalled()
++  })
++
++  it('pauses when the leader pauses', () => {
++    const audio = simulatedAudio({ positionMs: 30000 })
++    setup(audio, 't1')
++    follow()
++
++    act(() => {
++      store.dispatch(
++        listenAlongUpdate({ ...session, state: 'paused', positionMs: 31000 }),
++      )
++    })
++
++    expect(audio.pause).toHaveBeenCalled()
++    expect(audio.seeks).toBe(0)
++  })
++
++  it("catches up with the leader's moves while paused when they resume", () => {
++    const audio = simulatedAudio({ positionMs: 30000 })
++    setup(audio, 't1')
++    follow()
++    act(() => {
++      store.dispatch(
++        listenAlongUpdate({ ...session, state: 'paused', positionMs: 60000 }),
++      )
++    })
++    expect(audio.seeks).toBe(0)
++
++    act(() => {
++      store.dispatch(listenAlongUpdate({ ...session, positionMs: 60000 }))
++    })
++    expect(audio.currentTime).toBe(60)
++    expect(audio.paused).toBe(false)
++  })
++
++  it("keeps the listener's own pause on periodic leader reports", async () => {
++    const audio = simulatedAudio({ positionMs: 30000 })
++    setup(audio, 't1')
++    follow()
++    audio.pause()
++    audio.play.mockClear()
++
++    act(() => {
++      store.dispatch(listenAlongUpdate({ ...session, positionMs: 90000 }))
++    })
++    await advance(2000)
++
++    expect(audio.play).not.toHaveBeenCalled()
++    expect(audio.currentTime).toBe(30)
++    expect(store.getState().listenAlong.leader).toEqual(leader)
++  })
++
++  it('stops following when the listener seeks', async () => {
++    const audio = simulatedAudio({ positionMs: 30000 })
++    setup(audio, 't1')
++    follow()
++    await advance(2000)
++
++    act(() => {
++      audio.currentTime = 90
++    })
++
++    expect(store.getState().listenAlong.leader).toBeNull()
++    expect(mockNotify).toHaveBeenCalledWith('listenAlong.left', 'info', {
++      username: 'admin',
++    })
++  })
++
++  it('ignores the seeks the player makes while loading a track', async () => {
++    const audio = simulatedAudio({ positionMs: 30000 })
++    setup(audio, 't1')
++    follow()
++    await advance(2000)
++
++    act(() => {
++      audio.emit('loadstart')
++      audio.currentTime = 0
++    })
++
++    expect(store.getState().listenAlong.leader).toEqual(leader)
++  })
++
++  it('stops following when the listener picks another track', async () => {
++    setup(simulatedAudio({ positionMs: 30000 }), 't1')
++    follow()
++
++    act(() => {
++      store.dispatch({ type: PLAYER_CHOOSE_TRACK, data: { id: 'mine' } })
++    })
++
++    expect(store.getState().listenAlong.leader).toBeNull()
++  })
++
++  it("follows the leader's track changes", async () => {
++    mockGetOne.mockResolvedValue({ data: { id: 't2' } })
++    setup(simulatedAudio({ positionMs: 30000 }), 't1')
++    follow()
++
++    await act(async () => {
++      store.dispatch(listenAlongUpdate({ ...session, trackId: 't2' }))
++    })
++
++    expect(store.getState().player.current.trackId).toBe('t2')
++    expect(store.getState().listenAlong.leader).toEqual(leader)
++  })
++
++  it("refreshes the leader's session on now playing updates", async () => {
++    const audio = simulatedAudio({ positionMs: 30000 })
++    setup(audio, 't1')
++    follow()
++    mockGetNowPlaying.mockResolvedValue(
++      nowPlaying([leaderEntry({ state: 'paused', positionMs: 40000 })]),
++    )
++
++    await act(async () => {
++      store.dispatch({ type: 'nowPlayingCount' })
++      await vi.advanceTimersByTimeAsync(600)
++    })
++
++    expect(store.getState().listenAlong.session).toMatchObject({
++      trackId: 't1',
++      state: 'paused',
++      positionMs: 40000,
++    })
++    expect(audio.pause).toHaveBeenCalled()
++  })
++
++  it('keeps following while the leader moves to their next track', async () => {
++    setup(simulatedAudio({ positionMs: 30000 }), 't1')
++    follow()
++    mockGetNowPlaying.mockResolvedValue(nowPlaying([]))
++    await advance(600)
++
++    mockGetNowPlaying.mockResolvedValue(nowPlaying([leaderEntry()]))
++    await act(async () => {
++      store.dispatch({ type: 'nowPlayingCount' })
++      await vi.advanceTimersByTimeAsync(LEADER_GONE_GRACE_MS)
++    })
++
++    expect(store.getState().listenAlong.leader).toEqual(leader)
++    expect(mockNotify).not.toHaveBeenCalled()
++  })
++
++  it('stops following when the leader stays gone', async () => {
++    setup(simulatedAudio({ positionMs: 30000 }), 't1')
++    mockGetNowPlaying.mockResolvedValue(nowPlaying([]))
++    follow()
++
++    await advance(600)
++    expect(store.getState().listenAlong.leader).toEqual(leader)
++
++    await advance(LEADER_GONE_GRACE_MS)
++    expect(store.getState().listenAlong.leader).toBeNull()
++    expect(mockNotify).toHaveBeenCalledWith('listenAlong.ended', 'info', {
++      username: 'admin',
++    })
++  })
++
++  it("mirrors the leader's playback rate and restores it when it stops", () => {
++    const audio = simulatedAudio({ positionMs: 30000 })
++    setup(audio, 't1')
++    follow({ ...session, playbackRate: 1.5 })
++    expect(audio.playbackRate).toBe(1.5)
++
++    act(() => {
++      store.dispatch({ type: PLAYER_CHOOSE_TRACK, data: { id: 'mine' } })
++    })
++
++    expect(audio.playbackRate).toBe(1)
++  })
++
++  it("waits for the leader's next track when a track ends", async () => {
++    mockGetOne.mockResolvedValue({ data: { id: 't2' } })
++    const audio = simulatedAudio({ positionMs: 30000 })
++    setup(audio, 't1')
++    follow()
++
++    // The player clears the current track, then starts the queue over
++    act(() => {
++      audio.emit('ended')
++      store.dispatch({ type: PLAYER_CHOOSE_TRACK, data: {} })
++      store.dispatch({ type: PLAYER_CHOOSE_TRACK, data: { id: 'queued' } })
++      audio.play()
++    })
++    expect(audio.paused).toBe(true)
++    expect(store.getState().listenAlong.leader).toEqual(leader)
++
++    await act(async () => {
++      store.dispatch(
++        listenAlongUpdate({ ...session, trackId: 't2', positionMs: 0 }),
++      )
++    })
++    expect(store.getState().player.current.trackId).toBe('t2')
++    expect(audio.paused).toBe(false)
++  })
++})
+diff --git a/ui/src/reducers/index.js b/ui/src/reducers/index.js
+index 64a0049b..38ac60a2 100644
+--- a/ui/src/reducers/index.js
++++ b/ui/src/reducers/index.js
+@@ -7,3 +7,4 @@ export * from './activityReducer'
+ export * from './settingsReducer'
+ export * from './replayGainReducer'
+ export * from './transcodingReducer'
++export * from './listenAlongReducer'
+diff --git a/ui/src/reducers/listenAlongReducer.js b/ui/src/reducers/listenAlongReducer.js
+new file mode 100644
+index 00000000..28247e17
+--- /dev/null
++++ b/ui/src/reducers/listenAlongReducer.js
+@@ -0,0 +1,35 @@
++import {
++  LISTEN_ALONG_START,
++  LISTEN_ALONG_STOP,
++  LISTEN_ALONG_UPDATE,
++} from '../actions'
++
++const initialState = {
++  leader: null,
++  session: null,
++  // Local time the session was received, used to extrapolate the leader's position
++  receivedAt: 0,
++}
++
++export const listenAlongReducer = (previousState = initialState, payload) => {
++  const { type, data } = payload
++  switch (type) {
++    case LISTEN_ALONG_START:
++      return {
++        leader: data.leader,
++        session: data.session,
++        receivedAt: Date.now(),
++      }
++    case LISTEN_ALONG_UPDATE:
++      if (!previousState.leader) return previousState
++      return {
++        ...previousState,
++        session: data.session,
++        receivedAt: data.receivedAt,
++      }
++    case LISTEN_ALONG_STOP:
++      return initialState
++    default:
++      return previousState
++  }
++}
+diff --git a/ui/src/reducers/listenAlongReducer.test.js b/ui/src/reducers/listenAlongReducer.test.js
+new file mode 100644
+index 00000000..ce4d156c
+--- /dev/null
++++ b/ui/src/reducers/listenAlongReducer.test.js
+@@ -0,0 +1,61 @@
++import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
++import { listenAlongReducer } from './listenAlongReducer'
++import {
++  listenAlongStart,
++  listenAlongStop,
++  listenAlongUpdate,
++} from '../actions'
++
++describe('listenAlongReducer', () => {
++  const initialState = { leader: null, session: null, receivedAt: 0 }
++  const leader = { username: 'admin', playerName: 'NavidromeUI' }
++  const session = { username: 'admin', trackId: 't1', state: 'playing' }
++
++  beforeEach(() => {
++    vi.useFakeTimers()
++    vi.setSystemTime(1000)
++  })
++
++  afterEach(() => {
++    vi.useRealTimers()
++  })
++
++  it('returns the initial state', () => {
++    expect(listenAlongReducer(undefined, {})).toEqual(initialState)
++  })
++
++  it('starts following with the current session', () => {
++    expect(
++      listenAlongReducer(initialState, listenAlongStart(leader, session)),
++    ).toEqual({ leader, session, receivedAt: 1000 })
++  })
++
++  it('stops following', () => {
++    const state = { leader, session, receivedAt: 1000 }
++    expect(listenAlongReducer(state, listenAlongStop())).toEqual(initialState)
++  })
++
++  it("updates the leader's session", () => {
++    const state = { leader, session, receivedAt: 1000 }
++    vi.setSystemTime(5000)
++    const update = { ...session, state: 'paused', positionMs: 4000 }
++    expect(listenAlongReducer(state, listenAlongUpdate(update))).toEqual({
++      leader,
++      session: update,
++      receivedAt: 5000,
++    })
++  })
++
++  it('keeps the time the position was estimated at', () => {
++    const state = { leader, session, receivedAt: 1000 }
++    expect(
++      listenAlongReducer(state, listenAlongUpdate(session, 4500)).receivedAt,
++    ).toBe(4500)
++  })
++
++  it('ignores updates when not following', () => {
++    expect(listenAlongReducer(initialState, listenAlongUpdate(session))).toBe(
++      initialState,
++    )
++  })
++})
