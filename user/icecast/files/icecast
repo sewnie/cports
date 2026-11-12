@@ -1,0 +1,7 @@
+type = process
+command = /usr/bin/icecast -c /etc/icecast.xml
+run-as = _icecast
+logfile = /var/log/icecast.log
+smooth-recovery = true
+depends-on: network.target
+depends-on: local.target
