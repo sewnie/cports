@@ -1,0 +1,6 @@
+type = process
+command = /usr/bin/cloudflared --config /etc/cloudflared/config.yaml
+run-as = _cloudflared
+logfile = /var/log/cloudflared.log
+depends-on: network.target
+depends-on: local.target
